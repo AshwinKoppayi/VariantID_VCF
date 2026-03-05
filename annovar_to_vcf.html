@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Annovar indel → VCF indel converter</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 24px; line-height: 1.35; }
+    h1 { font-size: 18px; margin: 0 0 12px; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+    textarea { width: 100%; min-height: 140px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; padding: 10px; }
+    select, input, button { padding: 8px 10px; font-size: 14px; }
+    button { cursor: pointer; }
+    .card { border: 1px solid #ddd; border-radius: 10px; padding: 14px; margin-top: 14px; }
+    .muted { color: #555; font-size: 13px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #fafafa; }
+    .ok { color: #0a7a0a; font-weight: 600; }
+    .bad { color: #b00020; font-weight: 600; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <h1>Annovar (chrom-start-ref-alt) → VCF (chrom-pos-ref-alt)</h1>
+  <div class="muted">
+    Supports SNVs/MNVs and indels in Annovar avinput style (e.g. <span class="mono">3-128481302--GT</span>, <span class="mono">3-128483348-G-</span>).
+    For indels, it fetches the anchor base at <span class="mono">start-1</span> from Ensembl.
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label>
+        Assembly:
+        <select id="assembly">
+          <option value="grch38">GRCh38 (Ensembl)</option>
+          <option value="grch37">GRCh37 (Ensembl)</option>
+        </select>
+      </label>
+
+      <label>
+        Species:
+        <input id="species" value="human" />
+      </label>
+
+      <label title="If Ensembl fetch fails (rate-limit / offline), you can provide the anchor base manually.">
+        Manual anchor base (optional):
+        <input id="manualAnchor" placeholder="A/C/G/T" maxlength="1" style="width:70px" />
+      </label>
+
+      <button id="convertBtn">Convert</button>
+      <button id="copyBtn">Copy output</button>
+    </div>
+
+    <textarea id="input" placeholder="One per line:
+3-128481302--GT
+3-128483348-G-
+3-128485999--C
+3-128481301-G-A"></textarea>
+  </div>
+
+  <div class="card">
+    <div class="muted">Output (tab-delimited):</div>
+    <textarea id="output" readonly></textarea>
+  </div>
+
+  <div class="card">
+    <div class="muted">Details:</div>
+    <div id="tableWrap"></div>
+  </div>
+
+<script>
+  // Ensembl REST "sequence/region/:species/:region" endpoint
+  // GRCh38: https://rest.ensembl.org/documentation/info/sequence_region
+  // GRCh37: https://grch37.rest.ensembl.org/documentation/info/sequence_region
+  const ENSEMBL = {
+    grch38: "https://rest.ensembl.org",
+    grch37: "https://grch37.rest.ensembl.org"
+  };
+
+  function normalizeChrom(chrom) {
+    // allow inputs like "3" or "chr3"
+    chrom = chrom.trim();
+    if (!chrom) return chrom;
+    // Ensembl typically accepts "3" not "chr3" for human; but it also often accepts both.
+    // We'll standardize to no "chr" prefix.
+    if (chrom.toLowerCase().startsWith("chr")) return chrom.slice(3);
+    return chrom;
+  }
+
+  // Parse Annovar-like string "chrom-start-ref-alt"
+  // Important: keep empty fields (e.g., "--GT") meaning ref="-"
+  function parseAnnovarLine(line) {
+    const raw = line.trim();
+    if (!raw) return null;
+
+    const parts = raw.split("-");
+    if (parts.length < 4) {
+      return { raw, error: "Expected format chrom-start-ref-alt (4 fields)" };
+    }
+
+    const chrom = normalizeChrom(parts[0]);
+    const startStr = parts[1];
+    const start = Number(startStr);
+
+    if (!Number.isInteger(start) || start <= 0) {
+      return { raw, error: "Start must be a positive integer (1-based)" };
+    }
+
+    // ref can be empty -> insertion => "-"
+    const ref = (parts[2] === "" ? "-" : parts[2]).toUpperCase();
+    // alt might include additional '-' if present; re-join
+    let alt = parts.slice(3).join("-");
+    alt = (alt === "" ? "-" : alt).toUpperCase();
+
+    // Basic allele validation
+    const okAllele = (a) => a === "-" || /^[ACGTN]+$/i.test(a);
+    if (!okAllele(ref) || !okAllele(alt)) {
+      return { raw, error: "Ref/Alt must be A/C/G/T/N or '-' for indels" };
+    }
+
+    return { raw, chrom, start, ref, alt };
+  }
+
+  async function fetchAnchorBase({ assembly, species, chrom, pos1 }) {
+    // pos1 is 1-based single position; fetch exactly that base.
+    const baseUrl = ENSEMBL[assembly];
+    const region = `${chrom}:${pos1}..${pos1}:1`;
+    const url = `${baseUrl}/sequence/region/${encodeURIComponent(species)}/${encodeURIComponent(region)}?content-type=text/plain`;
+
+    const res = await fetch(url, {
+      headers: { "Content-Type": "text/plain", "Accept": "text/plain" }
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(`Ensembl fetch failed (${res.status}). ${text?.slice(0,120) || ""}`.trim());
+    }
+    const seq = (await res.text()).trim().toUpperCase();
+    if (!/^[ACGTN]$/.test(seq)) {
+      throw new Error(`Unexpected anchor sequence: '${seq}'`);
+    }
+    return seq;
+  }
+
+  function annovarToVcf({ chrom, start, ref, alt, anchor }) {
+    // SNV/MNV: already VCF-like
+    if (ref !== "-" && alt !== "-") {
+      return { chrom, pos: start, refVcf: ref, altVcf: alt, note: "SNV/MNV" };
+    }
+
+    const pos = start - 1; // VCF anchor position
+    if (pos < 1) throw new Error("Cannot anchor at start=1 (pos would be 0)");
+
+    if (!anchor || !/^[ACGTN]$/.test(anchor)) {
+      throw new Error("Missing/invalid anchor base (A/C/G/T/N)");
+    }
+
+    // insertion: ref '-' alt inserted sequence
+    if (ref === "-" && alt !== "-") {
+      return { chrom, pos, refVcf: anchor, altVcf: anchor + alt, note: "Insertion" };
+    }
+
+    // deletion: ref deleted sequence alt '-'
+    if (ref !== "-" && alt === "-") {
+      return { chrom, pos, refVcf: anchor + ref, altVcf: anchor, note: "Deletion" };
+    }
+
+    throw new Error(`Unexpected ref/alt: ref='${ref}' alt='${alt}'`);
+  }
+
+  function toTsvRow(obj) {
+  return [
+    obj.raw,
+    obj.chrom ?? "",
+    obj.pos ?? "",
+    obj.refVcf ?? "",
+    obj.altVcf ?? "",
+    obj.vcfId ?? "",
+    obj.status ?? "",
+    obj.note ?? "",
+    obj.error ?? ""
+  ].join("\t");
+}
+
+  async function convertAll() {
+    const assembly = document.getElementById("assembly").value;
+    const species = document.getElementById("species").value.trim() || "human";
+    const manualAnchor = document.getElementById("manualAnchor").value.trim().toUpperCase();
+    const input = document.getElementById("input").value.split(/\r?\n/);
+
+    const header = [
+  "INPUT",
+  "CHROM",
+  "POS_VCF",
+  "REF_VCF",
+  "ALT_VCF",
+  "VCF_ID",
+  "STATUS",
+  "TYPE",
+  "ERROR"
+].join("\t");
+
+
+    const rows = [header];
+    const detail = [];
+
+    for (const line of input) {
+      const parsed = parseAnnovarLine(line);
+      if (!parsed) continue;
+
+      if (parsed.error) {
+        rows.push(toTsvRow({ raw: parsed.raw, status: "FAIL", error: parsed.error }));
+        detail.push({ ...parsed, status: "FAIL" });
+        continue;
+      }
+
+      try {
+        let anchor = null;
+
+        // Need anchor only for indels
+        const needsAnchor = (parsed.ref === "-" || parsed.alt === "-");
+        if (needsAnchor) {
+          if (manualAnchor) {
+            anchor = manualAnchor;
+          } else {
+            const anchorPos = parsed.start - 1;
+            anchor = await fetchAnchorBase({
+              assembly,
+              species,
+              chrom: parsed.chrom,
+              pos1: anchorPos
+            });
+          }
+        }
+
+        const v = annovarToVcf({ ...parsed, anchor });
+        const vcfId = `${v.chrom}-${v.pos}-${v.refVcf}-${v.altVcf}`;
+
+rows.push(toTsvRow({
+  raw: parsed.raw,
+  chrom: v.chrom,
+  pos: v.pos,
+  refVcf: v.refVcf,
+  altVcf: v.altVcf,
+  vcfId: vcfId,
+  status: "OK",
+  note: v.note
+}));
+
+
+        detail.push({
+          input: parsed.raw,
+          chrom: v.chrom,
+          start_annovar: parsed.start,
+          pos_vcf: v.pos,
+          ref_annovar: parsed.ref,
+          alt_annovar: parsed.alt,
+          anchor: anchor ?? "",
+          ref_vcf: v.refVcf,
+          alt_vcf: v.altVcf,
+          type: v.note,
+          status: "OK"
+        });
+
+      } catch (e) {
+        rows.push(toTsvRow({ raw: parsed.raw, status: "FAIL", error: e.message }));
+        detail.push({
+          input: parsed.raw,
+          chrom: parsed.chrom,
+          start_annovar: parsed.start,
+          ref_annovar: parsed.ref,
+          alt_annovar: parsed.alt,
+          status: "FAIL",
+          error: e.message
+        });
+      }
+    }
+
+    document.getElementById("output").value = rows.join("\n");
+    renderTable(detail);
+  }
+
+  function renderTable(detail) {
+    const wrap = document.getElementById("tableWrap");
+    if (!detail.length) { wrap.innerHTML = "<div class='muted'>No rows.</div>"; return; }
+
+    const cols = [
+      "status","type","input","chrom","start_annovar","pos_vcf",
+      "ref_annovar","alt_annovar","anchor","ref_vcf","alt_vcf","error"
+    ];
+
+    let html = "<table><thead><tr>";
+    for (const c of cols) html += `<th>${c}</th>`;
+    html += "</tr></thead><tbody>";
+
+    for (const r of detail) {
+      const statusClass = r.status === "OK" ? "ok" : "bad";
+      html += "<tr>";
+      for (const c of cols) {
+        const val = (r[c] ?? "");
+        if (c === "status") html += `<td class="${statusClass}">${val}</td>`;
+        else html += `<td class="mono">${String(val)}</td>`;
+      }
+      html += "</tr>";
+    }
+
+    html += "</tbody></table>";
+    wrap.innerHTML = html;
+  }
+
+  document.getElementById("convertBtn").addEventListener("click", () => {
+    convertAll();
+  });
+
+  document.getElementById("copyBtn").addEventListener("click", async () => {
+    const out = document.getElementById("output").value;
+    await navigator.clipboard.writeText(out);
+    alert("Copied output to clipboard!");
+  });
+</script>
+</body>
+</html>
